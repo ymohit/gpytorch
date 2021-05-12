@@ -17,6 +17,7 @@ from ..functions._inv_quad import InvQuad
 from ..functions._inv_quad_log_det import InvQuadLogDet
 from ..functions._matmul import Matmul
 from ..functions._pivoted_cholesky import PivotedCholesky
+from ..functions._precond_inv_quad_logdet import PrecondInvQuadLogDet
 from ..functions._root_decomposition import RootDecomposition
 from ..functions._sqrt_inv_matmul import SqrtInvMatmul
 from ..utils.broadcasting import _matmul_broadcast_shape, _mul_broadcast_shape
@@ -1274,22 +1275,40 @@ class LazyTensor(ABC):
         if inv_quad_rhs is not None:
             args = [inv_quad_rhs] + list(args)
 
-        probe_vectors, probe_vector_norms = self._probe_vectors_and_norms()
+        preconditioner, precond_lt, p_exact_logdet = self._preconditioner()
 
-        func = InvQuadLogDet.apply
+        if precond_lt is None or (not logdet):
+            probe_vectors, probe_vector_norms = self._probe_vectors_and_norms()
+            func = InvQuadLogDet.apply
+            inv_quad_term, logdet_term = func(
+                self.representation_tree(),
+                self.dtype,
+                self.device,
+                self.matrix_shape,
+                self.batch_shape,
+                (inv_quad_rhs is not None),
+                logdet,
+                probe_vectors,
+                probe_vector_norms,
+                *args,
+            )
 
-        inv_quad_term, logdet_term = func(
-            self.representation_tree(),
-            self.dtype,
-            self.device,
-            self.matrix_shape,
-            self.batch_shape,
-            (inv_quad_rhs is not None),
-            logdet,
-            probe_vectors,
-            probe_vector_norms,
-            *args,
-        )
+        else:
+            func = PrecondInvQuadLogDet.apply
+            precond_args = precond_lt.representation()
+            inv_quad_term, pinvk_logdet = func(
+                self.representation_tree(),
+                precond_lt.representation_tree(),
+                preconditioner,
+                self.dtype,
+                self.device,
+                self.matrix_shape,
+                self.batch_shape,
+                (inv_quad_rhs is not None),
+                len(precond_args),
+                *(list(args) + list(precond_args)),
+            )
+            logdet_term = pinvk_logdet + p_exact_logdet
 
         if inv_quad_term.numel() and reduce_inv_quad:
             inv_quad_term = inv_quad_term.sum(-1)

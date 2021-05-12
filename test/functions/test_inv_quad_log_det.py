@@ -12,7 +12,7 @@ from gpytorch.test.base_test_case import BaseTestCase
 
 class TestInvQuadLogDetNonBatch(BaseTestCase, unittest.TestCase):
     seed = 0
-    matrix_shape = torch.Size((4, 4))
+    matrix_shape = torch.Size((50, 50))
 
     def _test_inv_quad_logdet(self, inv_quad_rhs=None, logdet=False, improper_logdet=False, add_diag=False):
         # Set up
@@ -46,7 +46,9 @@ class TestInvQuadLogDetNonBatch(BaseTestCase, unittest.TestCase):
             0
         ), gpytorch.settings.cg_tolerance(1e-5), gpytorch.settings.skip_logdet_forward(improper_logdet), patch(
             "gpytorch.utils.linear_cg", new=_wrapped_cg
-        ) as linear_cg_mock:
+        ) as linear_cg_mock, gpytorch.settings.min_preconditioning_size(
+            0
+        ):
             lazy_tensor = RootLazyTensor(mat)
 
             if add_diag:
