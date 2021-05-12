@@ -30,7 +30,6 @@ class PrecondInvQuadLogDet(Function):
         num_precond_args,
         *args,
     ):
-        print("Using precond inv quad logdet function")
         """
         *args - The arguments representing the PSD matrix A (or batch of PSD matrices A)
         If self.inv_quad is true, the first entry in *args is inv_quad_rhs (Tensor)
