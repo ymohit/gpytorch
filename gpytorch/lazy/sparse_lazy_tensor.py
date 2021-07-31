@@ -1,33 +1,104 @@
-import copy
-
 import torch
-from torch import Tensor
+from numpy import prod
+from torch import Size, Tensor
 
 from ..utils.getitem import _is_noop_index, _noop_index
 from ..utils.memoize import cached
 from .lazy_tensor import LazyTensor
+from .non_lazy_tensor import NonLazyTensor
+
+
+def _sparse_matmul(sparse_tensor, rhs):
+    # TODO: test for rhs with both 2-D and 3-D shapes, i.e, * X * and b X * X * .
+    if sparse_tensor.ndim <= 2:
+        if rhs.ndim == 1:
+            return torch.mv(sparse_tensor, rhs)
+        elif rhs.ndim == 2:
+            return torch.sparse.mm(sparse_tensor, rhs)
+        elif rhs.ndim == 3:
+            # a batched soln from https://github.com/pytorch/pytorch/issues/14489#issuecomment-607730242
+            # this works for non batched mvms
+            batch_size = rhs.shape[0]
+            # Stack the vector batch into columns. (b, n, k) -> (n, b, k) -> (n, b*k)
+            vectors = rhs.transpose(0, 1).reshape(sparse_tensor.shape[1], -1)
+            # A matrix-matrix product is a batched matrix-vector product of the columns.
+            # And then reverse the reshaping. (m, n) x (n, b*k) = (m, b*k) -> (m, b, k) -> (b, m, k)
+            return (
+                torch.sparse.mm(sparse_tensor, vectors).reshape(sparse_tensor.shape[-1], batch_size, -1).transpose(1, 0)
+            )
+    else:
+        # we need to compute a direct sum (b, m, n) -> (bm, bn) to flatten the sparse tensor to have two
+        # dimensions
+        sparse_tensor = sparse_tensor.coalesce()
+        indices, values = sparse_tensor.indices(), sparse_tensor.values()
+        tsr_shape = list(sparse_tensor.shape)
+        updated_size = [tsr_shape[0] * tsr_shape[1], tsr_shape[0] * tsr_shape[2]]
+        new_sparse_tensor = torch.sparse_coo_tensor(
+            indices=indices[0] * indices[1:], values=values, size=updated_size, device=indices.device
+        ).coalesce()
+        if rhs.ndim < 3:
+            new_rhs = torch.cat([rhs for _ in range(tsr_shape[0])], dim=0)
+        else:
+            new_rhs = torch.cat([rhs[i] for i in range(tsr_shape[0])], dim=0)
+
+        direct_result = _sparse_matmul(new_sparse_tensor, new_rhs.contiguous())
+        result = direct_result.reshape(tsr_shape[0], tsr_shape[1], -1)
+        return result
+
+
+# def _sparse_add(sparse_tensor, rhs):
+#     # TODO: test for rhs with both 2-D and 3-D shapes, i.e, * X * and b X * X * .
+#     if sparse_tensor.ndim <= 2:
+#         if rhs.ndim <= 2:
+#             return rhs + sparse_tensor
+#         else:
+#             # TODO: a similar to case to that above
+#             # raise NotImplementedError("Batched rhs addition is not implemented yet.")
+#             sparse_tensor = sparse_tensor.coalesce()
+#             indices, values = sparse_tensor.indices(), sparse_tensor.values()
+#             tsr_shape = list(sparse_tensor.shape)
+#             updated_size = [rhs.shape[0] * tsr_shape[0], rhs.shape[0] * tsr_shape[1]]
+#             # the new sparse tensor is now (bm, bn)
+#             new_indices = torch.cat([idx * indices for idx in range(rhs.shape[0])], dim=1)
+#             new_values = torch.cat([values for _ in range(rhs.shape[0])], dim=0)
+#             new_sparse_tensor = torch.sparse_coo_tensor(
+#                 indices=new_indices, values=new_values, size=updated_size, device=indices.device
+#             ).coalesce()
+#             # we now need to reshape the rhs from (b, m, n) -> (bm, bn)
+#             new_rhs = torch.cat([rhs[i] for i in range(rhs.shape[0])], dim=0)
+#             # we need to tile this, TODO: replace the tiling with zeros
+#             new_rhs = torch.cat([new_rhs for _ in range(rhs.shape[0])], dim=1)
+#             direct_result = _sparse_add(new_sparse_tensor, new_rhs.contiguous())
+#             # now we need to matmul with stacked identities
+#             stacked_eye = torch.cat([torch.eye(rhs.shape[1]) for _ in range(rhs.shape[0])], dim=0)
+#             direct_result = direct_result.matmul(stacked_eye)
+
+#             result = direct_result.reshape(rhs.shape[0], tsr_shape[1], -1)
+#             return result
+#     else:
+#         # we need to compute a direct sum (b, m, n) -> (bm, bn) to flatten the sparse tensor to have two
+#         # dimensions
+#         sparse_tensor = sparse_tensor.coalesce()
+#         indices, values = sparse_tensor.indices(), sparse_tensor.values()
+#         tsr_shape = list(sparse_tensor.shape)
+#         updated_size = [tsr_shape[0] * tsr_shape[1], tsr_shape[0], tsr_shape[2]]
+#         new_sparse_tensor = torch.sparse_coo_tensor(
+#             indices=indices[0] * indices[1:], values=values, size=updated_size, device=indices.device
+#         ).coalesce()
+#         if rhs.ndim < 3:
+#             new_rhs = torch.cat([rhs for _ in range(tsr_shape[0])], dim=0)
+#         else:
+#             print(rhs.shape, tsr_shape)
+#             new_rhs = torch.cat([rhs[i] for i in range(tsr_shape[0])], dim=0)
+
+#         print(new_sparse_tensor.shape, new_rhs.shape)
+#         direct_result = _sparse_add(new_sparse_tensor, new_rhs.contiguous())
+#         result = direct_result.reshape(tsr_shape[0], tsr_shape[1], -1)
+#         return result
 
 
 class SparseLazyTensor(LazyTensor):
-    def _check_args(self, indices, values, sparse_size):
-
-        if indices.shape[:-2] != values.shape[:-1]:
-            return (
-                "indices size ({}) is incompatible with values size ({}). Make sure the two have the "
-                "same number of batch dimensions".format(indices.size(), values.size())
-            )
-
-        if indices.size()[-1] != values.size()[-1]:
-            return "Expected number of indices ({}) to have the same size as values ({})".format(
-                indices.size()[-1], values.size()[-1]
-            )
-
-        if indices.size()[-2] != len(sparse_size):
-            return "Expected number dimenions ({}) to have the same as length of size ({})".format(
-                indices.size()[-2], len(sparse_size)
-            )
-
-    def __init__(self, indices: Tensor, values: Tensor, sparse_size: Tensor):
+    def __init__(self, indices: Tensor, values: Tensor, sparse_size: Size):
         """
         Sparse Lazy Tensor. Lazify torch.sparse_coo_tensor and supports arbitrary batch sizes.
         Args:
@@ -39,40 +110,27 @@ class SparseLazyTensor(LazyTensor):
 
         TODO: revisit this as it seems to me that ndim=2 is sufficient for most cases.
         """
-        super().__init__(indices, values, sparse_size)
+        super().__init__(indices, values, torch.tensor(sparse_size))
 
         # Local variable to keep batch shape as batch dimensions are squeezed in _tensor for efficiency.
-        self._batch_shape = indices.shape[:-2]
+        # self._batch_shape = indices.shape[:-2]
+        self.sparse_size = torch.Size(sparse_size)
+        self._batch_shape = self.sparse_size[:-2]
 
-        num_batches, ndim, nse = self._batch_shape.numel(), indices.shape[-2], indices.shape[-1]
+        ndim, nse = indices.shape[-2], indices.shape[-1]
 
         self.ndim = ndim  # dimension of the sparse matrices
         self.nse = nse  # number of specified elements
-        self.sparse_size = sparse_size
 
-        if num_batches > 1:
-            indices = indices.reshape(num_batches, ndim, nse)
-            values = values.reshape(num_batches, nse)
-            tensor_size = (num_batches, *sparse_size.to(torch.int64).numpy())
-            tensor = self.setup_3dtensor(indices=indices, values=values, tensor_size=tensor_size)
-
-        else:
-            tensor = torch.sparse_coo_tensor(
-                indices=indices, values=values, size=tuple(sparse_size.to(torch.int64).numpy()), device=indices.device
-            )
+        tensor = torch.sparse_coo_tensor(
+            indices=indices, values=values, size=self.sparse_size, device=indices.device, dtype=values.dtype
+        )
 
         self._tensor = tensor.coalesce()
 
-    def setup_3dtensor(self, indices, values, tensor_size):
-
-        batch_indices = torch.hstack([torch.ones(self.nse) * i for i in torch.arange(indices.shape[0])])
-        indices = torch.vstack([batch_indices, torch.hstack(list(indices))])
-
-        values = values.reshape(-1)
-
-        return torch.sparse_coo_tensor(
-            indices=indices, values=values, size=tensor_size, device=indices.device, requires_grad=False
-        )
+    @property
+    def dtype(self):
+        return self._tensor.dtype
 
     def to_dense(self):
         return self._tensor.to_dense().reshape(*self.size())
@@ -97,12 +155,11 @@ class SparseLazyTensor(LazyTensor):
         return self._tensor.to_dense().reshape(self.shape)
 
     def _matmul(self, rhs: Tensor) -> Tensor:
-        # TODO: test for rhs with both 2-D and 3-D shapes, i.e, * X * and b X * X * .
-        # Most likely, I'd need some usage of _mul_broadcast_shape.
-        if self.ndimension() == 3:
-            return torch.bmm(self._tensor, rhs).reshape(*self.shape[:-1], -1)
-        else:
-            return torch.sparse.mm(self._tensor, rhs)
+        return _sparse_matmul(self._tensor, rhs)
+
+    def diag(self):
+        # TODO: there is a more efficient algorithm by searching for matches in the indices
+        return self.to_dense().diag()
 
     def matmul(self, tensor):
         return self._matmul(rhs=tensor)
@@ -129,10 +186,22 @@ class SparseLazyTensor(LazyTensor):
         if not self._tensor.is_coalesced():
             self._tensor = self._tensor.coalesce()
 
-        indices = self._tensor.indices().unsqueeze(0).expand(*batch_shape, self.ndim, self.nse)
-        values = self._tensor.values().unsqueeze(0).expand(*batch_shape, self.nse)
+        # TODO: probably want to store indices, values as a property to avoid repeated fn calls
+        # we now have (batch_shape) * nz non zero indices
+        current_indices = self._tensor.indices()
+        starting_values = self._tensor.values()
 
-        return self.__class__(indices=indices, values=values, sparse_size=self.sparse_size,)
+        expanded_values = starting_values.repeat_interleave(prod(batch_shape))
+        # TODO: is there something more efficient than a for loop?
+        ndims = len(batch_shape)
+        for dim in range(ndims):
+            rg = torch.arange(batch_shape[dim]).to(starting_values)
+            interleaved_rg = rg.repeat_interleave(starting_values.shape[-1])
+            current_indices = torch.cat([current_indices] * batch_shape[dim], dim=-1)
+            current_indices = torch.cat([interleaved_rg.unsqueeze(0), current_indices], dim=0)
+
+        expanded_shape = torch.Size([*batch_shape, *self.sparse_size])
+        return self.__class__(indices=current_indices, values=expanded_values, sparse_size=expanded_shape)
 
     def _getitem(self, row_index, col_index, *batch_indices):
         if len(self.batch_shape) > 0:
@@ -166,14 +235,18 @@ class SparseLazyTensor(LazyTensor):
         )
 
     def __add__(self, other):
-        if isinstance(other, SparseLazyTensor):
-            new_sparse_lazy_tensor = copy.deepcopy(self)
-            new_sparse_lazy_tensor._tensor += other._tensor
-            return new_sparse_lazy_tensor
-        return super(SparseLazyTensor, self).__add__(other)
+        # if isinstance(other, SparseLazyTensor):
+        #     new_sparse_lazy_tensor = copy.deepcopy(self)
+        #     new_sparse_lazy_tensor._tensor = new_sparse_lazy_tensor._tensor + other._tensor
+        #     return new_sparse_lazy_tensor
+        if isinstance(other, LazyTensor) or isinstance(other, SparseLazyTensor):
+            return super(SparseLazyTensor, self).__add__(other)
+        if isinstance(other, torch.Tensor):
+            # return NonLazyTensor(_sparse_add(self._tensor, other))
+            # TODO: use sparse addition for speed gains
+            return NonLazyTensor(self._tensor.to_dense() + other)
 
     def _sum_batch(self, dim):
-
         indices = self._tensor.indices().reshape(self.batch_shape, self.ndim, self.nse)
         values = self._tensor.values().reshape(self.batch_shape, self.nse)
 
@@ -186,6 +259,9 @@ class SparseLazyTensor(LazyTensor):
                 for indices_split, values_split in zip(indices_splits, values_splits)
             ]
         )
+
+    def sum(self, dim=None):
+        return self._tensor.sum(dim)
 
     def _permute_batch(self, *dims):
         indices = self._tensor.indices().reshape(self.batch_shape, self.ndim, self.nse)

@@ -26,6 +26,7 @@ from .mul_lazy_tensor import MulLazyTensor
 from .non_lazy_tensor import NonLazyTensor, lazify
 from .psd_sum_lazy_tensor import PsdSumLazyTensor
 from .root_lazy_tensor import RootLazyTensor
+from .sparse_lazy_tensor import SparseLazyTensor
 from .sum_batch_lazy_tensor import SumBatchLazyTensor
 from .sum_kronecker_lazy_tensor import SumKroneckerLazyTensor
 from .sum_lazy_tensor import SumLazyTensor
@@ -63,6 +64,7 @@ __all__ = [
     "NonLazyTensor",
     "PsdSumLazyTensor",
     "RootLazyTensor",
+    "SparseLazyTensor",
     "SumLazyTensor",
     "SumBatchLazyTensor",
     "ToeplitzLazyTensor",
